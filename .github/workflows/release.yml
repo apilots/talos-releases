@@ -117,6 +117,8 @@ jobs:
           repository: ${{ needs.prepare.outputs.source_repo }}
           ref: ${{ needs.prepare.outputs.source_ref }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -164,18 +166,9 @@ jobs:
           PRODUCT_DIR: ${{ github.workspace }}/dist/products/release
           DESKTOP_PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
           SERVER_PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          TUI_PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: ./build.sh "${{ matrix.build_target }}"
-
-      - name: Package directory products
-        if: ${{ matrix.build_target == 'tui' }}
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          tar -czf "dist/products/release/tui/talos-tui-${RELEASE_VERSION}-linux-x64.tar.gz" \
-            -C "dist/products/release/tui" \
-            talos-ui-tui conf
 
       - name: Upload product artifact
         uses: actions/upload-artifact@v4
@@ -198,10 +191,94 @@ jobs:
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
       R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
     steps:
+      - name: Checkout Talos source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download product artifacts
         uses: actions/download-artifact@v4
         with:
           path: downloaded
+
+      - name: Generate release body
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          SOURCE_REPO: ${{ needs.prepare.outputs.source_repo }}
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" --match 'v*' 2>/dev/null || true)"
+          log_range="${RELEASE_TAG}"
+          changelog_label="initial release"
+          changelog_url="https://github.com/${SOURCE_REPO}/commits/${RELEASE_TAG}"
+          if [[ -n "${previous_tag}" ]]; then
+            log_range="${previous_tag}..${RELEASE_TAG}"
+            changelog_label="${previous_tag}...${RELEASE_TAG}"
+            changelog_url="https://github.com/${SOURCE_REPO}/compare/${previous_tag}...${RELEASE_TAG}"
+          fi
+
+          features_file="$(mktemp)"
+          fixes_file="$(mktemp)"
+          changelog_file="$(mktemp)"
+
+          link_prs() {
+            local subject="$1"
+            printf '%s\n' "${subject}" | perl -pe "s~\\(#([0-9]+)\\)~([#\\1](https://github.com/${SOURCE_REPO}/pull/\\1))~g"
+          }
+
+          add_line() {
+            local file="$1"
+            local line="$2"
+            printf -- "- %s\n" "${line}" >> "${file}"
+          }
+
+          feat_re='^feat(\([^)]+\))?:[[:space:]]*(.+)$'
+          fix_re='^fix(\([^)]+\))?:[[:space:]]*(.+)$'
+          changelog_re='^(docs|style|test|refactor|tool|revert|chore)(\([^)]+\))?:[[:space:]]*(.+)$'
+
+          while IFS= read -r subject; do
+            [[ -n "${subject}" ]] || continue
+            if [[ "${subject}" =~ ${feat_re} ]]; then
+              add_line "${features_file}" "$(link_prs "${BASH_REMATCH[2]}")"
+            elif [[ "${subject}" =~ ${fix_re} ]]; then
+              add_line "${fixes_file}" "$(link_prs "${BASH_REMATCH[2]}")"
+            elif [[ "${subject}" =~ ${changelog_re} ]]; then
+              add_line "${changelog_file}" "$(link_prs "${BASH_REMATCH[1]}: ${BASH_REMATCH[3]}")"
+            else
+              add_line "${changelog_file}" "$(link_prs "other: ${subject}")"
+            fi
+          done < <(git log "${log_range}" --pretty=format:%s)
+
+          {
+            echo "## New Features"
+            if [[ -s "${features_file}" ]]; then
+              cat "${features_file}"
+            else
+              echo "- None"
+            fi
+            echo
+            echo "## Bug Fixes"
+            if [[ -s "${fixes_file}" ]]; then
+              cat "${fixes_file}"
+            else
+              echo "- None"
+            fi
+            echo
+            echo "## Changelog"
+            echo
+            echo "Full Changelog: [${changelog_label}](${changelog_url})"
+            echo
+            if [[ -s "${changelog_file}" ]]; then
+              cat "${changelog_file}"
+            else
+              echo "- None"
+            fi
+          } > release-body.md
 
       - name: Prepare release assets
         env:
@@ -219,7 +296,7 @@ jobs:
             group="$(basename "$(dirname "${file}")")"
             dest="${base}"
 
-            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" ]]; then
+            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" || "${base}" == "talos" || "${base}" == "SHA256SUMS" ]]; then
               continue
             fi
 
@@ -315,7 +392,4 @@ jobs:
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           files: release-assets/*
-          body: |
-            Source: `${{ needs.prepare.outputs.source_repo }}@${{ needs.prepare.outputs.source_ref }}`
-
-            R2 upload runs only when the R2 secrets are configured.
+          body_path: release-body.md
