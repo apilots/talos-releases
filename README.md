@@ -19,4 +19,10 @@ Current release scope:
 - `Talos-TUI-<version>-linux-amd64.tar.gz`
 - `Talos-TUI-<version>-linux-arm64.tar.gz`
 
+Package entry points:
+
+- TUI tarballs expose `bin/talos` and bundle the private App Server runtime at `libexec/app-server`.
+- Server tarballs expose `bin/talos-server` and include the WebUI bundle.
+- `libexec/app-server` is a private runtime file and is not uploaded as a standalone release asset.
+
 R2 upload support is included but optional. It runs only when the R2 secrets are configured in this repository.

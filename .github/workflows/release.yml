@@ -306,7 +306,7 @@ jobs:
             group="$(basename "$(dirname "${file}")")"
             dest="${base}"
 
-            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" || "${base}" == "talos" || "${base}" == "SHA256SUMS" ]]; then
+            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" || "${base}" == "talos" || "${base}" == "app-server" || "${base}" == "SHA256SUMS" ]]; then
               continue
             fi
 
