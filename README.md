@@ -13,8 +13,10 @@ The `Build release` workflow is invoked by the main Talos repository through `re
 Current release scope:
 
 - `Talos-Desktop-<version>-macos-arm64.dmg`
-- `Talos-Desktop-<version>-linux-amd64.tar.gz`
+- `Talos-Desktop-<version>-linux-amd64.AppImage`
 - `Talos-Server-<version>-linux-amd64.tar.gz`
+- `Talos-Server-<version>-linux-arm64.tar.gz`
 - `Talos-TUI-<version>-linux-amd64.tar.gz`
+- `Talos-TUI-<version>-linux-arm64.tar.gz`
 
 R2 upload support is included but optional. It runs only when the R2 secrets are configured in this repository.

@@ -96,18 +96,28 @@ jobs:
             build_target: desktop-mac
             product_subdir: desktop-mac
           - name: Linux Desktop
-            artifact_name: talos-desktop-linux
+            artifact_name: talos-desktop-linux-amd64
             runner: ubuntu-latest
             build_target: desktop-linux
             product_subdir: desktop-linux
-          - name: Server WebUI
-            artifact_name: talos-server-webui-linux
+          - name: Server WebUI linux-amd64
+            artifact_name: talos-server-webui-linux-amd64
             runner: ubuntu-latest
             build_target: server-webui
             product_subdir: server
-          - name: TUI
-            artifact_name: talos-tui-linux
+          - name: Server WebUI linux-arm64
+            artifact_name: talos-server-webui-linux-arm64
+            runner: ubuntu-24.04-arm
+            build_target: server-webui
+            product_subdir: server
+          - name: TUI linux-amd64
+            artifact_name: talos-tui-linux-amd64
             runner: ubuntu-latest
+            build_target: tui
+            product_subdir: tui
+          - name: TUI linux-arm64
+            artifact_name: talos-tui-linux-arm64
+            runner: ubuntu-24.04-arm
             build_target: tui
             product_subdir: tui
     steps:
