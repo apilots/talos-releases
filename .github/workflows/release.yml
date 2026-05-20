@@ -1,0 +1,305 @@
+name: Build release
+
+on:
+  repository_dispatch:
+    types:
+      - talos_release
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source tag to release, for example v0.1.0"
+        required: true
+        type: string
+      source_repo:
+        description: "Source repository"
+        required: false
+        default: apilots/talos
+        type: string
+      source_ref:
+        description: "Source ref. Defaults to refs/tags/<tag>."
+        required: false
+        type: string
+      source_sha:
+        description: "Source commit sha, used only for manifest metadata."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      source_repo: ${{ steps.metadata.outputs.source_repo }}
+      source_ref: ${{ steps.metadata.outputs.source_ref }}
+      source_sha: ${{ steps.metadata.outputs.source_sha }}
+    steps:
+      - name: Resolve release metadata
+        id: metadata
+        env:
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          DISPATCH_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
+          DISPATCH_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
+          DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
+          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          TAG="${DISPATCH_TAG:-${INPUT_TAG:-}}"
+          SOURCE_REPO="${DISPATCH_SOURCE_REPO:-${INPUT_SOURCE_REPO:-apilots/talos}}"
+          SOURCE_REF="${DISPATCH_SOURCE_REF:-${INPUT_SOURCE_REF:-}}"
+          SOURCE_SHA="${DISPATCH_SOURCE_SHA:-${INPUT_SOURCE_SHA:-}}"
+
+          if [[ -z "${TAG}" ]]; then
+            echo "A release tag is required." >&2
+            exit 1
+          fi
+
+          if [[ "${TAG}" != v* ]]; then
+            echo "Release tags must use the v* format." >&2
+            exit 1
+          fi
+
+          VERSION="${DISPATCH_VERSION:-${TAG#v}}"
+          if [[ -z "${SOURCE_REF}" ]]; then
+            SOURCE_REF="refs/tags/${TAG}"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "source_repo=${SOURCE_REPO}"
+            echo "source_ref=${SOURCE_REF}"
+            echo "source_sha=${SOURCE_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs:
+      - prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Desktop
+            artifact_name: talos-desktop-macos
+            runner: macos-latest
+            build_target: desktop-mac
+            product_subdir: desktop-mac
+          - name: Linux Desktop
+            artifact_name: talos-desktop-linux
+            runner: ubuntu-latest
+            build_target: desktop-linux
+            product_subdir: desktop-linux
+          - name: Server WebUI
+            artifact_name: talos-server-webui-linux
+            runner: ubuntu-latest
+            build_target: server-webui
+            product_subdir: server
+          - name: TUI
+            artifact_name: talos-tui-linux
+            runner: ubuntu-latest
+            build_target: tui
+            product_subdir: tui
+    steps:
+      - name: Checkout Talos source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: talos-rs
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: talos-app/pnpm-lock.yaml
+
+      - name: Install pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@9.14.4 --activate
+
+      - name: Install frontend dependencies
+        run: pnpm --dir talos-app install --frozen-lockfile
+
+      - name: Build product
+        env:
+          PROFILE: release
+          PRODUCT_DIR: ${{ github.workspace }}/dist/products/release
+          DESKTOP_PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          SERVER_PACKAGE_VERSION: ${{ needs.prepare.outputs.version }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: ./build.sh "${{ matrix.build_target }}"
+
+      - name: Package directory products
+        if: ${{ matrix.build_target == 'tui' }}
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -czf "dist/products/release/tui/talos-tui-${RELEASE_VERSION}-linux-x64.tar.gz" \
+            -C "dist/products/release/tui" \
+            talos-ui-tui conf
+
+      - name: Upload product artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/products/release/${{ matrix.product_subdir }}/**
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+    steps:
+      - name: Download product artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Prepare release assets
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_REPO: ${{ needs.prepare.outputs.source_repo }}
+          SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release-assets
+          find downloaded -type f -print0 | while IFS= read -r -d '' file; do
+            base="$(basename "${file}")"
+            group="$(basename "$(dirname "${file}")")"
+            dest="${base}"
+
+            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" ]]; then
+              continue
+            fi
+
+            if [[ -e "release-assets/${dest}" ]]; then
+              dest="${group}-${base}"
+            fi
+
+            cp "${file}" "release-assets/${dest}"
+          done
+
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f ! -name checksums.txt -print0 \
+              | sort -z \
+              | xargs -0 sha256sum > checksums.txt
+          )
+
+          assets_json="$(mktemp)"
+          printf '[]' > "${assets_json}"
+          while read -r checksum path; do
+            name="${path#./}"
+            size="$(stat -c %s "release-assets/${name}")"
+            url=""
+            if [[ -n "${R2_PUBLIC_BASE_URL}" ]]; then
+              url="${R2_PUBLIC_BASE_URL%/}/stable/${RELEASE_TAG}/${name}"
+            fi
+
+            jq \
+              --arg name "${name}" \
+              --arg checksum "${checksum}" \
+              --arg size "${size}" \
+              --arg url "${url}" \
+              '. += [{
+                name: $name,
+                sha256: $checksum,
+                size: ($size | tonumber),
+                url: $url
+              }]' "${assets_json}" > "${assets_json}.next"
+            mv "${assets_json}.next" "${assets_json}"
+          done < release-assets/checksums.txt
+
+          jq -n \
+            --arg tag "${RELEASE_TAG}" \
+            --arg version "${RELEASE_VERSION}" \
+            --arg source_repo "${SOURCE_REPO}" \
+            --arg source_ref "${SOURCE_REF}" \
+            --arg source_sha "${SOURCE_SHA}" \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg r2_base_url "${R2_PUBLIC_BASE_URL}" \
+            --slurpfile assets "${assets_json}" \
+            '{
+              tag: $tag,
+              version: $version,
+              source: {
+                repository: $source_repo,
+                ref: $source_ref,
+                sha: $source_sha
+              },
+              generated_at: $generated_at,
+              r2_base_url: $r2_base_url,
+              assets: $assets[0]
+            }' > release-assets/manifest.json
+
+      - name: Upload release assets to R2
+        if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          ENDPOINT_URL="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          VERSION_PREFIX="stable/${RELEASE_TAG}"
+          LATEST_PREFIX="stable/latest"
+
+          aws s3 sync release-assets "s3://${R2_BUCKET}/${VERSION_PREFIX}/" \
+            --endpoint-url "${ENDPOINT_URL}" \
+            --delete
+
+          aws s3 cp "release-assets/manifest.json" "s3://${R2_BUCKET}/${LATEST_PREFIX}/manifest.json" \
+            --endpoint-url "${ENDPOINT_URL}"
+
+          aws s3 cp "release-assets/checksums.txt" "s3://${R2_BUCKET}/${LATEST_PREFIX}/checksums.txt" \
+            --endpoint-url "${ENDPOINT_URL}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Talos ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: release-assets/*
+          body: |
+            Source: `${{ needs.prepare.outputs.source_repo }}@${{ needs.prepare.outputs.source_ref }}`
+
+            R2 upload runs only when the R2 secrets are configured.
