@@ -141,6 +141,23 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir talos-app install --frozen-lockfile
 
+      - name: Set package versions
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const version = process.env.RELEASE_VERSION;
+          const paths = ["talos-app/desktop/package.json"];
+
+          for (const path of paths) {
+            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
+            pkg.version = version;
+            fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
+          }
+          NODE
+
       - name: Build product
         env:
           PROFILE: release
