@@ -126,18 +126,17 @@ jobs:
         with:
           workspaces: talos-rs
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.14.4
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
           cache: pnpm
           cache-dependency-path: talos-app/pnpm-lock.yaml
-
-      - name: Install pnpm
-        run: |
-          set -euo pipefail
-          corepack enable
-          corepack prepare pnpm@9.14.4 --activate
 
       - name: Install frontend dependencies
         run: pnpm --dir talos-app install --frozen-lockfile
