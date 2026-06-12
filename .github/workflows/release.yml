@@ -130,6 +130,17 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Checkout Talos Cloud SDK source
+        uses: actions/checkout@v4
+        with:
+          repository: apilots/talos-cloud
+          path: talos-cloud
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Link Talos Cloud SDK path dependency
+        run: ln -sfn "${GITHUB_WORKSPACE}/talos-cloud" "${GITHUB_WORKSPACE}/../talos-cloud"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
