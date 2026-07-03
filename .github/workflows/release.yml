@@ -268,7 +268,6 @@ jobs:
       - name: Set Docker metadata
         id: docker_metadata
         env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -282,7 +281,6 @@ jobs:
           {
             echo "image_name=${image_name}"
             echo "revision=${revision}"
-            echo "arch_tag=${RELEASE_TAG}-${{ matrix.arch }}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
@@ -296,18 +294,39 @@ jobs:
           password: ${{ github.token }}
 
       - name: Build and push server image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: talos/build/server/Dockerfile
           platforms: ${{ matrix.platform }}
-          push: true
           provenance: false
-          tags: |
-            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.arch_tag }}
+          outputs: type=image,name=${{ steps.docker_metadata.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
             REVISION=${{ steps.docker_metadata.outputs.revision }}
+
+      - name: Export image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "${RUNNER_TEMP}/digests"
+          digest="${IMAGE_DIGEST#sha256:}"
+          if [[ -z "${digest}" || "${digest}" == "${IMAGE_DIGEST}" ]]; then
+            echo "Invalid image digest: ${IMAGE_DIGEST}" >&2
+            exit 1
+          fi
+          touch "${RUNNER_TEMP}/digests/${digest}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: talos-server-image-digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
   docker-manifest:
     name: Publish server image manifest
@@ -345,6 +364,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Download image digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: talos-server-image-digests-*
+          merge-multiple: true
+
       - name: Create multi-architecture manifest
         env:
           IMAGE_NAME: ${{ steps.docker_metadata.outputs.image_name }}
@@ -353,6 +379,15 @@ jobs:
           PUBLISH_LATEST: ${{ steps.docker_metadata.outputs.publish_latest }}
         run: |
           set -euo pipefail
+
+          sources=()
+          while IFS= read -r digest_file; do
+            sources+=("${IMAGE_NAME}@sha256:$(basename "${digest_file}")")
+          done < <(find "${RUNNER_TEMP}/digests" -type f | sort)
+          if [[ "${#sources[@]}" -ne 2 ]]; then
+            echo "Expected 2 image digests, found ${#sources[@]}." >&2
+            exit 1
+          fi
 
           tags=(
             --tag "${IMAGE_NAME}:${RELEASE_TAG}"
@@ -364,8 +399,7 @@ jobs:
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "${IMAGE_NAME}:${RELEASE_TAG}-amd64" \
-            "${IMAGE_NAME}:${RELEASE_TAG}-arm64"
+            "${sources[@]}"
 
           docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}"
 
@@ -395,10 +429,7 @@ jobs:
               image: $image,
               digest: $digest,
               tags: ([$release_tag, $version_tag] + (if $publish_latest_bool then ["latest"] else [] end)),
-              architecture_tags: [
-                ($release_tag + "-amd64"),
-                ($release_tag + "-arm64")
-              ],
+              architecture_tags: [],
               platforms: ["linux/amd64", "linux/arm64"]
             }' > image-metadata/server-image.json
 
@@ -534,6 +565,9 @@ jobs:
               continue
             fi
             if [[ "${base}" == "server-image.json" ]]; then
+              continue
+            fi
+            if [[ "${group}" == talos-server-image-digests-* ]]; then
               continue
             fi
 
