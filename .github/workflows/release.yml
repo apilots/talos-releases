@@ -269,7 +269,6 @@ jobs:
         id: docker_metadata
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
           SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -283,8 +282,7 @@ jobs:
           {
             echo "image_name=${image_name}"
             echo "revision=${revision}"
-            echo "version_arch_tag=${RELEASE_VERSION}-${{ matrix.arch }}"
-            echo "tag_arch_tag=${RELEASE_TAG}-${{ matrix.arch }}"
+            echo "arch_tag=${RELEASE_TAG}-${{ matrix.arch }}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
@@ -304,9 +302,9 @@ jobs:
           file: talos/build/server/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
+          provenance: false
           tags: |
-            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.version_arch_tag }}
-            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.tag_arch_tag }}
+            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.arch_tag }}
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
             REVISION=${{ steps.docker_metadata.outputs.revision }}
@@ -399,9 +397,7 @@ jobs:
               tags: ([$release_tag, $version_tag] + (if $publish_latest_bool then ["latest"] else [] end)),
               architecture_tags: [
                 ($release_tag + "-amd64"),
-                ($release_tag + "-arm64"),
-                ($version_tag + "-amd64"),
-                ($version_tag + "-arm64")
+                ($release_tag + "-arm64")
               ],
               platforms: ["linux/amd64", "linux/arm64"]
             }' > image-metadata/server-image.json
