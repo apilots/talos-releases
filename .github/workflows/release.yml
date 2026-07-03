@@ -23,9 +23,20 @@ on:
         description: "Source commit sha, used only for manifest metadata."
         required: false
         type: string
+      publish_release_assets:
+        description: "Build and publish binary release assets."
+        required: false
+        default: true
+        type: boolean
+      publish_latest:
+        description: "Move the stable latest container tag."
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   prepare:
@@ -37,6 +48,8 @@ jobs:
       source_repo: ${{ steps.metadata.outputs.source_repo }}
       source_ref: ${{ steps.metadata.outputs.source_ref }}
       source_sha: ${{ steps.metadata.outputs.source_sha }}
+      publish_release_assets: ${{ steps.metadata.outputs.publish_release_assets }}
+      publish_latest: ${{ steps.metadata.outputs.publish_latest }}
     steps:
       - name: Resolve release metadata
         id: metadata
@@ -46,10 +59,14 @@ jobs:
           DISPATCH_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
           DISPATCH_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
           DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+          DISPATCH_PUBLISH_RELEASE_ASSETS: ${{ github.event.client_payload.publish_release_assets }}
+          DISPATCH_PUBLISH_LATEST: ${{ github.event.client_payload.publish_latest }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
           INPUT_SOURCE_REF: ${{ inputs.source_ref }}
           INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_PUBLISH_RELEASE_ASSETS: ${{ inputs.publish_release_assets }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
 
@@ -57,6 +74,8 @@ jobs:
           SOURCE_REPO="${DISPATCH_SOURCE_REPO:-${INPUT_SOURCE_REPO:-apilots/talos}}"
           SOURCE_REF="${DISPATCH_SOURCE_REF:-${INPUT_SOURCE_REF:-}}"
           SOURCE_SHA="${DISPATCH_SOURCE_SHA:-${INPUT_SOURCE_SHA:-}}"
+          PUBLISH_RELEASE_ASSETS="${DISPATCH_PUBLISH_RELEASE_ASSETS:-${INPUT_PUBLISH_RELEASE_ASSETS:-true}}"
+          PUBLISH_LATEST="${DISPATCH_PUBLISH_LATEST:-${INPUT_PUBLISH_LATEST:-true}}"
 
           if [[ -z "${TAG}" ]]; then
             echo "A release tag is required." >&2
@@ -72,6 +91,14 @@ jobs:
           if [[ -z "${SOURCE_REF}" ]]; then
             SOURCE_REF="refs/tags/${TAG}"
           fi
+          if [[ "${PUBLISH_RELEASE_ASSETS}" != "true" && "${PUBLISH_RELEASE_ASSETS}" != "false" ]]; then
+            echo "publish_release_assets must be true or false." >&2
+            exit 1
+          fi
+          if [[ "${PUBLISH_LATEST}" != "true" && "${PUBLISH_LATEST}" != "false" ]]; then
+            echo "publish_latest must be true or false." >&2
+            exit 1
+          fi
 
           {
             echo "tag=${TAG}"
@@ -79,12 +106,15 @@ jobs:
             echo "source_repo=${SOURCE_REPO}"
             echo "source_ref=${SOURCE_REF}"
             echo "source_sha=${SOURCE_SHA}"
+            echo "publish_release_assets=${PUBLISH_RELEASE_ASSETS}"
+            echo "publish_latest=${PUBLISH_LATEST}"
           } >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.name }}
     needs:
       - prepare
+    if: ${{ needs.prepare.outputs.publish_release_assets == 'true' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -199,11 +229,198 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  docker-image:
+    name: Build server image ${{ matrix.platform }}
+    needs:
+      - prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/talos-server
+    steps:
+      - name: Checkout Talos source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          path: talos
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Checkout Talos Cloud SDK source
+        uses: actions/checkout@v4
+        with:
+          repository: apilots/talos-cloud
+          path: talos-cloud
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Set Docker metadata
+        id: docker_metadata
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          image_name="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          revision="${SOURCE_SHA}"
+          if [[ -z "${revision}" ]]; then
+            revision="$(git -C talos rev-parse HEAD)"
+          fi
+
+          {
+            echo "image_name=${image_name}"
+            echo "revision=${revision}"
+            echo "version_arch_tag=${RELEASE_VERSION}-${{ matrix.arch }}"
+            echo "tag_arch_tag=${RELEASE_TAG}-${{ matrix.arch }}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: talos/build/server/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.version_arch_tag }}
+            ${{ steps.docker_metadata.outputs.image_name }}:${{ steps.docker_metadata.outputs.tag_arch_tag }}
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ steps.docker_metadata.outputs.revision }}
+
+  docker-manifest:
+    name: Publish server image manifest
+    needs:
+      - prepare
+      - docker-image
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/talos-server
+    steps:
+      - name: Set Docker metadata
+        id: docker_metadata
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          image_name="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          {
+            echo "image_name=${image_name}"
+            echo "version_tag=${RELEASE_VERSION}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "publish_latest=${PUBLISH_LATEST}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create multi-architecture manifest
+        env:
+          IMAGE_NAME: ${{ steps.docker_metadata.outputs.image_name }}
+          RELEASE_TAG: ${{ steps.docker_metadata.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.docker_metadata.outputs.version_tag }}
+          PUBLISH_LATEST: ${{ steps.docker_metadata.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          tags=(
+            --tag "${IMAGE_NAME}:${RELEASE_TAG}"
+            --tag "${IMAGE_NAME}:${VERSION_TAG}"
+          )
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            tags+=(--tag "${IMAGE_NAME}:latest")
+          fi
+
+          docker buildx imagetools create \
+            "${tags[@]}" \
+            "${IMAGE_NAME}:${RELEASE_TAG}-amd64" \
+            "${IMAGE_NAME}:${RELEASE_TAG}-arm64"
+
+          docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}"
+
+      - name: Write image metadata
+        env:
+          IMAGE_NAME: ${{ steps.docker_metadata.outputs.image_name }}
+          RELEASE_TAG: ${{ steps.docker_metadata.outputs.release_tag }}
+          VERSION_TAG: ${{ steps.docker_metadata.outputs.version_tag }}
+          PUBLISH_LATEST: ${{ steps.docker_metadata.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p image-metadata
+          digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}" | awk '/^Digest:/ { print $2; exit }')"
+          if [[ -z "${digest}" ]]; then
+            echo "Could not resolve image digest for ${IMAGE_NAME}:${RELEASE_TAG}" >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg image "${IMAGE_NAME}" \
+            --arg digest "${digest}" \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg version_tag "${VERSION_TAG}" \
+            --arg publish_latest "${PUBLISH_LATEST}" \
+            '($publish_latest == "true") as $publish_latest_bool | {
+              image: $image,
+              digest: $digest,
+              tags: ([$release_tag, $version_tag] + (if $publish_latest_bool then ["latest"] else [] end)),
+              architecture_tags: [
+                ($release_tag + "-amd64"),
+                ($release_tag + "-arm64"),
+                ($version_tag + "-amd64"),
+                ($version_tag + "-arm64")
+              ],
+              platforms: ["linux/amd64", "linux/arm64"]
+            }' > image-metadata/server-image.json
+
+      - name: Upload image metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: talos-server-image-metadata
+          path: image-metadata/server-image.json
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Publish release
     needs:
       - prepare
       - build
+      - docker-manifest
+    if: ${{ needs.prepare.outputs.publish_release_assets == 'true' }}
     runs-on: ubuntu-latest
     env:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -320,6 +537,9 @@ jobs:
             if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" || "${base}" == "talos" || "${base}" == "app-server" || "${base}" == "SHA256SUMS" ]]; then
               continue
             fi
+            if [[ "${base}" == "server-image.json" ]]; then
+              continue
+            fi
 
             if [[ -e "release-assets/${dest}" ]]; then
               dest="${group}-${base}"
@@ -359,6 +579,12 @@ jobs:
             mv "${assets_json}.next" "${assets_json}"
           done < release-assets/checksums.txt
 
+          server_image_json="downloaded/talos-server-image-metadata/server-image.json"
+          if [[ ! -f "${server_image_json}" ]]; then
+            echo "Missing server image metadata artifact: ${server_image_json}" >&2
+            exit 1
+          fi
+
           jq -n \
             --arg tag "${RELEASE_TAG}" \
             --arg version "${RELEASE_VERSION}" \
@@ -368,6 +594,7 @@ jobs:
             --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg r2_base_url "${R2_PUBLIC_BASE_URL}" \
             --slurpfile assets "${assets_json}" \
+            --slurpfile server_image "${server_image_json}" \
             '{
               tag: $tag,
               version: $version,
@@ -378,7 +605,10 @@ jobs:
               },
               generated_at: $generated_at,
               r2_base_url: $r2_base_url,
-              assets: $assets[0]
+              assets: $assets[0],
+              images: {
+                server: $server_image[0]
+              }
             }' > release-assets/manifest.json
 
       - name: Upload release assets to R2
