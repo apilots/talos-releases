@@ -502,18 +502,32 @@ jobs:
             printf -- "- %s\n" "${line}" >> "${file}"
           }
 
-          feat_re='^feat(\([^)]+\))?:[[:space:]]*(.+)$'
-          fix_re='^fix(\([^)]+\))?:[[:space:]]*(.+)$'
-          changelog_re='^(docs|style|test|refactor|tool|revert|chore)(\([^)]+\))?:[[:space:]]*(.+)$'
+          feat_re='^feat(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
+          fix_re='^fix(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
+          changelog_re='^(docs|style|test|refactor|tool|revert|chore)(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
 
-          while IFS= read -r subject; do
+          scoped_subject() {
+            local scope="$1"
+            local description="$2"
+            if [[ -n "${scope}" ]]; then
+              printf '%s: %s\n' "${scope}" "${description}"
+            else
+              printf '%s\n' "${description}"
+            fi
+          }
+
+          while IFS= read -r subject || [[ -n "${subject}" ]]; do
             [[ -n "${subject}" ]] || continue
             if [[ "${subject}" =~ ${feat_re} ]]; then
-              add_line "${features_file}" "$(link_prs "${BASH_REMATCH[2]}")"
+              add_line "${features_file}" "$(link_prs "$(scoped_subject "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")")"
             elif [[ "${subject}" =~ ${fix_re} ]]; then
-              add_line "${fixes_file}" "$(link_prs "${BASH_REMATCH[2]}")"
+              add_line "${fixes_file}" "$(link_prs "$(scoped_subject "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")")"
             elif [[ "${subject}" =~ ${changelog_re} ]]; then
-              add_line "${changelog_file}" "$(link_prs "${BASH_REMATCH[1]}: ${BASH_REMATCH[3]}")"
+              type="${BASH_REMATCH[1]}"
+              scope="${BASH_REMATCH[3]}"
+              description="${BASH_REMATCH[5]}"
+              rendered="$(scoped_subject "${scope}" "${description}")"
+              add_line "${changelog_file}" "$(link_prs "${type}: ${rendered}")"
             else
               add_line "${changelog_file}" "$(link_prs "other: ${subject}")"
             fi
