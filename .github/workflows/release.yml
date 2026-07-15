@@ -469,6 +469,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: downloaded
+          pattern: '!*.dockerbuild'
 
       - name: Generate release body
         env:
