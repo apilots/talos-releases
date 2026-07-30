@@ -576,15 +576,13 @@ jobs:
             group="$(basename "$(dirname "${file}")")"
             dest="${base}"
 
-            if [[ "${base}" == "talos-ui-tui" || "${base}" == "talos.yaml" || "${base}" == "talos" || "${base}" == "app-server" || "${base}" == "SHA256SUMS" ]]; then
-              continue
-            fi
-            if [[ "${base}" == "server-image.json" ]]; then
-              continue
-            fi
-            if [[ "${group}" == talos-server-image-digests-* ]]; then
-              continue
-            fi
+            case "${base}" in
+              *.AppImage|*.blockmap|*.dmg|*.tar.gz)
+                ;;
+              *)
+                continue
+                ;;
+            esac
 
             if [[ -e "release-assets/${dest}" ]]; then
               dest="${group}-${base}"
@@ -656,6 +654,31 @@ jobs:
               }
             }' > release-assets/manifest.json
 
+      - name: Remove stale GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          desired_assets="$(mktemp)"
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > "${desired_assets}"
+
+          gh release view "${RELEASE_TAG}" --json assets \
+            --jq '.assets[].name' \
+            | sort \
+            | while IFS= read -r asset; do
+                [[ -n "${asset}" ]] || continue
+                if grep -Fxq "${asset}" "${desired_assets}"; then
+                  continue
+                fi
+                gh release delete-asset "${RELEASE_TAG}" "${asset}" --yes
+              done
+
       - name: Upload release assets to R2
         if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != '' }}
         env:
@@ -687,5 +710,6 @@ jobs:
           name: Talos ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
+          overwrite_files: true
           files: release-assets/*
           body_path: release-body.md
