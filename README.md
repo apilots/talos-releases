@@ -18,13 +18,25 @@ Current release scope:
 - `Talos-Server-<version>-linux-arm64.tar.gz`
 - `Talos-TUI-<version>-linux-amd64.tar.gz`
 - `Talos-TUI-<version>-linux-arm64.tar.gz`
+- `Talos-TUI-<version>-macos-amd64.tar.gz`
+- `Talos-TUI-<version>-macos-arm64.tar.gz`
+- `install.sh`
 - `ghcr.io/apilots/talos-server:<version>` multi-architecture server image for `linux/amd64` and `linux/arm64`
 
 Package entry points:
 
-- TUI tarballs expose `bin/talos` and bundle the private App Server runtime at `libexec/app-server`.
+- TUI tarballs expose `bin/talos` and include the version-matched config template and database migrations under `conf/`.
 - Server tarballs expose `bin/talos-server` and include the WebUI bundle.
 - Server container images run `talos-server` with the production config and persist data in the default `/home/talos/.talos` home directory.
 - `libexec/app-server` is a private runtime file and is not uploaded as a standalone release asset.
 
 R2 upload support is included but optional. It runs only when the R2 secrets are configured in this repository.
+Published release tags and their versioned R2 prefixes are immutable. Rebuilding changed artifacts
+requires a new version tag; the workflow fails instead of replacing assets for an existing tag.
+
+Install the latest TUI bundle with:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/apilots/talos-releases/releases/latest/download/install.sh | sh
+```

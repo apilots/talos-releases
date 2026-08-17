@@ -38,6 +38,10 @@ permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: talos-release-${{ github.event.client_payload.tag || inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     name: Prepare release metadata
@@ -88,6 +92,18 @@ jobs:
           fi
 
           VERSION="${DISPATCH_VERSION:-${TAG#v}}"
+          if [[ -z "${VERSION}" ]]; then
+            echo "Release version must not be empty." >&2
+            exit 1
+          fi
+          if [[ "${VERSION}" != "${TAG#v}" ]]; then
+            echo "Release version ${VERSION} does not match tag ${TAG}." >&2
+            exit 1
+          fi
+          if [[ "${VERSION}" == *[!A-Za-z0-9._-]* ]]; then
+            echo "Release version contains unsupported characters: ${VERSION}" >&2
+            exit 1
+          fi
           if [[ -z "${SOURCE_REF}" ]]; then
             SOURCE_REF="refs/tags/${TAG}"
           fi
@@ -110,10 +126,68 @@ jobs:
             echo "publish_latest=${PUBLISH_LATEST}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Reject an existing release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          query_error="$(mktemp)"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            >/dev/null 2>"${query_error}"; then
+            echo "Release ${RELEASE_TAG} already exists; published tags are immutable." >&2
+            exit 1
+          fi
+          if ! grep -Fq "HTTP 404" "${query_error}"; then
+            cat "${query_error}" >&2
+            echo "Could not verify whether release ${RELEASE_TAG} already exists." >&2
+            exit 1
+          fi
+
+  validate-source:
+    name: Validate source release version
+    needs:
+      - prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Talos source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.source_repo }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Compare source and release versions
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          source_version="$(awk '
+            /^\[workspace.package\]/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && /^version = / {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' talos-rs/Cargo.toml)"
+          if [[ -z "${source_version}" ]]; then
+            echo "Could not resolve the Talos workspace version." >&2
+            exit 1
+          fi
+          if [[ "${source_version}" != "${RELEASE_VERSION}" ]]; then
+            echo "Talos workspace version ${source_version} does not match release version ${RELEASE_VERSION}." >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.name }}
     needs:
       - prepare
+      - validate-source
     if: ${{ needs.prepare.outputs.publish_release_assets == 'true' }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -142,12 +216,22 @@ jobs:
             product_subdir: server
           - name: TUI linux-amd64
             artifact_name: talos-tui-linux-amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             build_target: tui
             product_subdir: tui
           - name: TUI linux-arm64
             artifact_name: talos-tui-linux-arm64
             runner: ubuntu-24.04-arm
+            build_target: tui
+            product_subdir: tui
+          - name: TUI macOS AMD64
+            artifact_name: talos-tui-macos-amd64
+            runner: macos-15-intel
+            build_target: tui
+            product_subdir: tui
+          - name: TUI macOS ARM64
+            artifact_name: talos-tui-macos-arm64
+            runner: macos-15
             build_target: tui
             product_subdir: tui
     steps:
@@ -221,6 +305,13 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: ./build.sh "${{ matrix.build_target }}"
 
+      - name: Verify TUI release bundle
+        if: ${{ matrix.build_target == 'tui' }}
+        env:
+          PROFILE: release
+          PRODUCT_DIR: ${{ github.workspace }}/dist/products/release
+        run: ./build/scripts/verify-release-artifacts.sh tui
+
       - name: Upload product artifact
         uses: actions/upload-artifact@v4
         with:
@@ -233,6 +324,7 @@ jobs:
     name: Build server image ${{ matrix.platform }}
     needs:
       - prepare
+      - validate-source
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -465,6 +557,11 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Test TUI installer
+        run: |
+          deploy/install/tests/install_test.sh
+          deploy/install/tests/release_contract_test.sh
+
       - name: Download product artifacts
         uses: actions/download-artifact@v4
         with:
@@ -571,6 +668,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p release-assets
+          install -m 755 deploy/install/install.sh release-assets/install.sh
           find downloaded -type f -print0 | while IFS= read -r -d '' file; do
             base="$(basename "${file}")"
             group="$(basename "$(dirname "${file}")")"
@@ -654,31 +752,10 @@ jobs:
               }
             }' > release-assets/manifest.json
 
-      - name: Remove stale GitHub release assets
+      - name: Test final TUI release assets
         env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-
-          if ! gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPOSITORY}" >/dev/null 2>&1; then
-            exit 0
-          fi
-
-          desired_assets="$(mktemp)"
-          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > "${desired_assets}"
-
-          gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPOSITORY}" --json assets \
-            --jq '.assets[].name' \
-            | sort \
-            | while IFS= read -r asset; do
-                [[ -n "${asset}" ]] || continue
-                if grep -Fxq "${asset}" "${desired_assets}"; then
-                  continue
-                fi
-                gh release delete-asset "${RELEASE_TAG}" "${asset}" --repo "${RELEASE_REPOSITORY}" --yes
-              done
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: deploy/install/tests/release_assets_test.sh release-assets "${RELEASE_VERSION}"
 
       - name: Upload release assets to R2
         if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != '' }}
@@ -694,14 +771,28 @@ jobs:
           VERSION_PREFIX="stable/${RELEASE_TAG}"
           LATEST_PREFIX="stable/latest"
 
+          existing_count="$(aws s3api list-objects-v2 \
+            --bucket "${R2_BUCKET}" \
+            --prefix "${VERSION_PREFIX}/" \
+            --max-keys 1 \
+            --query KeyCount \
+            --output text \
+            --endpoint-url "${ENDPOINT_URL}")"
+          if [[ "${existing_count}" != "0" ]]; then
+            echo "R2 release prefix ${VERSION_PREFIX} already exists; published tags are immutable." >&2
+            exit 1
+          fi
+
           aws s3 sync release-assets "s3://${R2_BUCKET}/${VERSION_PREFIX}/" \
-            --endpoint-url "${ENDPOINT_URL}" \
-            --delete
+            --endpoint-url "${ENDPOINT_URL}"
 
           aws s3 cp "release-assets/manifest.json" "s3://${R2_BUCKET}/${LATEST_PREFIX}/manifest.json" \
             --endpoint-url "${ENDPOINT_URL}"
 
           aws s3 cp "release-assets/checksums.txt" "s3://${R2_BUCKET}/${LATEST_PREFIX}/checksums.txt" \
+            --endpoint-url "${ENDPOINT_URL}"
+
+          aws s3 cp "release-assets/install.sh" "s3://${R2_BUCKET}/${LATEST_PREFIX}/install.sh" \
             --endpoint-url "${ENDPOINT_URL}"
 
       - name: Create GitHub release
@@ -711,6 +802,6 @@ jobs:
           name: Talos ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
-          overwrite_files: true
+          overwrite_files: false
           files: release-assets/*
           body_path: release-body.md
