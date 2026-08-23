@@ -196,7 +196,7 @@ jobs:
         include:
           - name: macOS Desktop
             artifact_name: talos-desktop-macos
-            runner: macos-latest
+            runner: macos-26
             build_target: desktop-mac
             product_subdir: desktop-mac
           - name: Linux Desktop
@@ -226,12 +226,12 @@ jobs:
             product_subdir: tui
           - name: TUI macOS AMD64
             artifact_name: talos-tui-macos-amd64
-            runner: macos-15-intel
+            runner: macos-26-intel
             build_target: tui
             product_subdir: tui
           - name: TUI macOS ARM64
             artifact_name: talos-tui-macos-arm64
-            runner: macos-15
+            runner: macos-26
             build_target: tui
             product_subdir: tui
     steps:
