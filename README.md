@@ -8,7 +8,9 @@ This repository stores Talos release artifacts and release automation only. It d
 - Source repository: https://github.com/apilots/talos
 - Issues and discussion: use the main Talos repository.
 
-The `Build release` workflow is invoked by the main Talos repository through `repository_dispatch` whenever a `v*` tag is pushed. The workflow checks out the tagged Talos source, builds release artifacts through `build.sh`, uploads GitHub Actions artifacts, and creates a GitHub Release in this repository.
+The `Build release` workflow is invoked by the main Talos repository through `repository_dispatch` after a `v*` source Release is published and passes its release gate. The workflow checks out the tagged Talos source, builds release artifacts through `build.sh`, uploads GitHub Actions artifacts, and creates a GitHub Release in this repository.
+
+The matching Release in `apilots/talos` owns the canonical Release Notes. This repository reads that body by tag and publishes it unchanged. A missing or empty source Release fails the workflow; release-note generation is not duplicated here.
 
 Current release scope:
 
@@ -21,6 +23,8 @@ Current release scope:
 - `Talos-TUI-<version>-macos-amd64.tar.gz`
 - `Talos-TUI-<version>-macos-arm64.tar.gz`
 - `install.sh`
+- `checksums.txt`
+- `manifest.json`
 - `ghcr.io/apilots/talos-server:<version>` multi-architecture server image for `linux/amd64` and `linux/arm64`
 
 Package entry points:

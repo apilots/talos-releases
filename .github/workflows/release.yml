@@ -10,24 +10,6 @@ on:
         description: "Source tag to release, for example v0.1.0"
         required: true
         type: string
-      source_repo:
-        description: "Source repository"
-        required: false
-        default: apilots/talos
-        type: string
-      source_ref:
-        description: "Source ref. Defaults to refs/tags/<tag>."
-        required: false
-        type: string
-      source_sha:
-        description: "Source commit sha, used only for manifest metadata."
-        required: false
-        type: string
-      publish_release_assets:
-        description: "Build and publish binary release assets."
-        required: false
-        default: true
-        type: boolean
       publish_latest:
         description: "Move the stable latest container tag."
         required: false
@@ -49,10 +31,7 @@ jobs:
     outputs:
       tag: ${{ steps.metadata.outputs.tag }}
       version: ${{ steps.metadata.outputs.version }}
-      source_repo: ${{ steps.metadata.outputs.source_repo }}
       source_ref: ${{ steps.metadata.outputs.source_ref }}
-      source_sha: ${{ steps.metadata.outputs.source_sha }}
-      publish_release_assets: ${{ steps.metadata.outputs.publish_release_assets }}
       publish_latest: ${{ steps.metadata.outputs.publish_latest }}
     steps:
       - name: Resolve release metadata
@@ -60,25 +39,13 @@ jobs:
         env:
           DISPATCH_TAG: ${{ github.event.client_payload.tag }}
           DISPATCH_VERSION: ${{ github.event.client_payload.version }}
-          DISPATCH_SOURCE_REPO: ${{ github.event.client_payload.source_repo }}
-          DISPATCH_SOURCE_REF: ${{ github.event.client_payload.source_ref }}
-          DISPATCH_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
-          DISPATCH_PUBLISH_RELEASE_ASSETS: ${{ github.event.client_payload.publish_release_assets }}
           DISPATCH_PUBLISH_LATEST: ${{ github.event.client_payload.publish_latest }}
           INPUT_TAG: ${{ inputs.tag }}
-          INPUT_SOURCE_REPO: ${{ inputs.source_repo }}
-          INPUT_SOURCE_REF: ${{ inputs.source_ref }}
-          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
-          INPUT_PUBLISH_RELEASE_ASSETS: ${{ inputs.publish_release_assets }}
           INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
         run: |
           set -euo pipefail
 
           TAG="${DISPATCH_TAG:-${INPUT_TAG:-}}"
-          SOURCE_REPO="${DISPATCH_SOURCE_REPO:-${INPUT_SOURCE_REPO:-apilots/talos}}"
-          SOURCE_REF="${DISPATCH_SOURCE_REF:-${INPUT_SOURCE_REF:-}}"
-          SOURCE_SHA="${DISPATCH_SOURCE_SHA:-${INPUT_SOURCE_SHA:-}}"
-          PUBLISH_RELEASE_ASSETS="${DISPATCH_PUBLISH_RELEASE_ASSETS:-${INPUT_PUBLISH_RELEASE_ASSETS:-true}}"
           PUBLISH_LATEST="${DISPATCH_PUBLISH_LATEST:-${INPUT_PUBLISH_LATEST:-true}}"
 
           if [[ -z "${TAG}" ]]; then
@@ -104,13 +71,6 @@ jobs:
             echo "Release version contains unsupported characters: ${VERSION}" >&2
             exit 1
           fi
-          if [[ -z "${SOURCE_REF}" ]]; then
-            SOURCE_REF="refs/tags/${TAG}"
-          fi
-          if [[ "${PUBLISH_RELEASE_ASSETS}" != "true" && "${PUBLISH_RELEASE_ASSETS}" != "false" ]]; then
-            echo "publish_release_assets must be true or false." >&2
-            exit 1
-          fi
           if [[ "${PUBLISH_LATEST}" != "true" && "${PUBLISH_LATEST}" != "false" ]]; then
             echo "publish_latest must be true or false." >&2
             exit 1
@@ -119,10 +79,7 @@ jobs:
           {
             echo "tag=${TAG}"
             echo "version=${VERSION}"
-            echo "source_repo=${SOURCE_REPO}"
-            echo "source_ref=${SOURCE_REF}"
-            echo "source_sha=${SOURCE_SHA}"
-            echo "publish_release_assets=${PUBLISH_RELEASE_ASSETS}"
+            echo "source_ref=refs/tags/${TAG}"
             echo "publish_latest=${PUBLISH_LATEST}"
           } >> "${GITHUB_OUTPUT}"
 
@@ -150,20 +107,47 @@ jobs:
     needs:
       - prepare
     runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout Talos source
         uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.source_repo }}
+          repository: apilots/talos
           ref: ${{ needs.prepare.outputs.source_ref }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
-          fetch-depth: 1
+          fetch-depth: 0
+          fetch-tags: true
 
-      - name: Compare source and release versions
+      - name: Validate source tag, release, and version
+        id: source
         env:
+          GH_TOKEN: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
+
+          checkout_sha="$(git rev-parse HEAD)"
+          tag_sha="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "${checkout_sha}" != "${tag_sha}" ]]; then
+            echo "Checked out ${checkout_sha}, but ${RELEASE_TAG} resolves to ${tag_sha}." >&2
+            exit 1
+          fi
+
+          source_release="$(mktemp)"
+          gh api "repos/apilots/talos/releases/tags/${RELEASE_TAG}" > "${source_release}"
+          jq -e \
+            --arg tag "${RELEASE_TAG}" \
+            '.tag_name == $tag
+              and .draft == false
+              and (.published_at | type == "string" and length > 0)
+              and (.body | type == "string" and length > 0)' \
+            "${source_release}" >/dev/null || {
+              echo "Source release apilots/talos@${RELEASE_TAG} is not published or has empty notes." >&2
+              exit 1
+            }
+          jq -j '.body' "${source_release}" > release-body.md
 
           source_version="$(awk '
             /^\[workspace.package\]/ { in_workspace_package = 1; next }
@@ -183,12 +167,21 @@ jobs:
             exit 1
           fi
 
+          echo "sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Preserve canonical release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: canonical-release-notes
+          path: release-body.md
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.name }}
     needs:
       - prepare
       - validate-source
-    if: ${{ needs.prepare.outputs.publish_release_assets == 'true' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -238,7 +231,7 @@ jobs:
       - name: Checkout Talos source
         uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.source_repo }}
+          repository: apilots/talos
           ref: ${{ needs.prepare.outputs.source_ref }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
           fetch-depth: 0
@@ -342,7 +335,7 @@ jobs:
       - name: Checkout Talos source
         uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.source_repo }}
+          repository: apilots/talos
           ref: ${{ needs.prepare.outputs.source_ref }}
           path: talos
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
@@ -360,15 +353,12 @@ jobs:
       - name: Set Docker metadata
         id: docker_metadata
         env:
-          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.validate-source.outputs.source_sha }}
         run: |
           set -euo pipefail
 
           image_name="$(printf '%s' "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
           revision="${SOURCE_SHA}"
-          if [[ -z "${revision}" ]]; then
-            revision="$(git -C talos rev-parse HEAD)"
-          fi
 
           {
             echo "image_name=${image_name}"
@@ -537,9 +527,9 @@ jobs:
     name: Publish release
     needs:
       - prepare
+      - validate-source
       - build
       - docker-manifest
-    if: ${{ needs.prepare.outputs.publish_release_assets == 'true' }}
     runs-on: ubuntu-latest
     env:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -551,7 +541,7 @@ jobs:
       - name: Checkout Talos source
         uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.source_repo }}
+          repository: apilots/talos
           ref: ${{ needs.prepare.outputs.source_ref }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
           fetch-depth: 0
@@ -566,104 +556,21 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: downloaded
-          pattern: '!*.dockerbuild'
+          pattern: talos-*
 
-      - name: Generate release body
-        env:
-          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
-          SOURCE_REPO: ${{ needs.prepare.outputs.source_repo }}
-        run: |
-          set -euo pipefail
-
-          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^" --match 'v*' 2>/dev/null || true)"
-          log_range="${RELEASE_TAG}"
-          changelog_label="initial release"
-          changelog_url="https://github.com/${SOURCE_REPO}/commits/${RELEASE_TAG}"
-          if [[ -n "${previous_tag}" ]]; then
-            log_range="${previous_tag}..${RELEASE_TAG}"
-            changelog_label="${previous_tag}...${RELEASE_TAG}"
-            changelog_url="https://github.com/${SOURCE_REPO}/compare/${previous_tag}...${RELEASE_TAG}"
-          fi
-
-          features_file="$(mktemp)"
-          fixes_file="$(mktemp)"
-          changelog_file="$(mktemp)"
-
-          link_prs() {
-            local subject="$1"
-            printf '%s\n' "${subject}" | perl -pe "s~\\(#([0-9]+)\\)~([#\\1](https://github.com/${SOURCE_REPO}/pull/\\1))~g"
-          }
-
-          add_line() {
-            local file="$1"
-            local line="$2"
-            printf -- "- %s\n" "${line}" >> "${file}"
-          }
-
-          feat_re='^feat(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
-          fix_re='^fix(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
-          changelog_re='^(docs|style|test|refactor|tool|revert|chore)(\(([^)]+)\))?(!)?:[[:space:]]*(.+)$'
-
-          scoped_subject() {
-            local scope="$1"
-            local description="$2"
-            if [[ -n "${scope}" ]]; then
-              printf '%s: %s\n' "${scope}" "${description}"
-            else
-              printf '%s\n' "${description}"
-            fi
-          }
-
-          while IFS= read -r subject || [[ -n "${subject}" ]]; do
-            [[ -n "${subject}" ]] || continue
-            if [[ "${subject}" =~ ${feat_re} ]]; then
-              add_line "${features_file}" "$(link_prs "$(scoped_subject "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")")"
-            elif [[ "${subject}" =~ ${fix_re} ]]; then
-              add_line "${fixes_file}" "$(link_prs "$(scoped_subject "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}")")"
-            elif [[ "${subject}" =~ ${changelog_re} ]]; then
-              type="${BASH_REMATCH[1]}"
-              scope="${BASH_REMATCH[3]}"
-              description="${BASH_REMATCH[5]}"
-              rendered="$(scoped_subject "${scope}" "${description}")"
-              add_line "${changelog_file}" "$(link_prs "${type}: ${rendered}")"
-            else
-              add_line "${changelog_file}" "$(link_prs "other: ${subject}")"
-            fi
-          done < <(git log "${log_range}" --pretty=format:%s)
-
-          {
-            echo "## New Features"
-            if [[ -s "${features_file}" ]]; then
-              cat "${features_file}"
-            else
-              echo "- None"
-            fi
-            echo
-            echo "## Bug Fixes"
-            if [[ -s "${fixes_file}" ]]; then
-              cat "${fixes_file}"
-            else
-              echo "- None"
-            fi
-            echo
-            echo "## Changelog"
-            echo
-            echo "Full Changelog: [${changelog_label}](${changelog_url})"
-            echo
-            if [[ -s "${changelog_file}" ]]; then
-              cat "${changelog_file}"
-            else
-              echo "- None"
-            fi
-          } > release-body.md
+      - name: Download canonical release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: canonical-release-notes
+          path: .
 
       - name: Prepare release assets
         env:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          SOURCE_REPO: ${{ needs.prepare.outputs.source_repo }}
+          SOURCE_REPO: apilots/talos
           SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
-          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+          SOURCE_SHA: ${{ needs.validate-source.outputs.source_sha }}
         run: |
           set -euo pipefail
 
@@ -689,12 +596,14 @@ jobs:
             cp "${file}" "release-assets/${dest}"
           done
 
+          checksums_temp="$(mktemp)"
           (
             cd release-assets
             find . -maxdepth 1 -type f ! -name checksums.txt -print0 \
               | sort -z \
-              | xargs -0 sha256sum > checksums.txt
+              | xargs -0 sha256sum > "${checksums_temp}"
           )
+          mv "${checksums_temp}" release-assets/checksums.txt
 
           assets_json="$(mktemp)"
           printf '[]' > "${assets_json}"
@@ -757,12 +666,29 @@ jobs:
           RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
         run: deploy/install/tests/release_assets_test.sh release-assets "${RELEASE_VERSION}"
 
+      - name: Verify canonical release notes are unchanged
+        env:
+          GH_TOKEN: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          source_release="$(mktemp)"
+          current_body="$(mktemp)"
+          gh api "repos/apilots/talos/releases/tags/${RELEASE_TAG}" > "${source_release}"
+          jq -j '.body' "${source_release}" > "${current_body}"
+          cmp release-body.md "${current_body}" || {
+            echo "Source release notes changed after validation; refusing to publish." >&2
+            exit 1
+          }
+
       - name: Upload release assets to R2
         if: ${{ env.R2_ACCOUNT_ID != '' && env.R2_ACCESS_KEY_ID != '' && env.R2_SECRET_ACCESS_KEY != '' && env.R2_BUCKET != '' }}
         env:
           AWS_ACCESS_KEY_ID: ${{ env.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ env.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          PUBLISH_LATEST: ${{ needs.prepare.outputs.publish_latest }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
@@ -786,14 +712,14 @@ jobs:
           aws s3 sync release-assets "s3://${R2_BUCKET}/${VERSION_PREFIX}/" \
             --endpoint-url "${ENDPOINT_URL}"
 
-          aws s3 cp "release-assets/manifest.json" "s3://${R2_BUCKET}/${LATEST_PREFIX}/manifest.json" \
-            --endpoint-url "${ENDPOINT_URL}"
-
-          aws s3 cp "release-assets/checksums.txt" "s3://${R2_BUCKET}/${LATEST_PREFIX}/checksums.txt" \
-            --endpoint-url "${ENDPOINT_URL}"
-
-          aws s3 cp "release-assets/install.sh" "s3://${R2_BUCKET}/${LATEST_PREFIX}/install.sh" \
-            --endpoint-url "${ENDPOINT_URL}"
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            aws s3 cp "release-assets/manifest.json" "s3://${R2_BUCKET}/${LATEST_PREFIX}/manifest.json" \
+              --endpoint-url "${ENDPOINT_URL}"
+            aws s3 cp "release-assets/checksums.txt" "s3://${R2_BUCKET}/${LATEST_PREFIX}/checksums.txt" \
+              --endpoint-url "${ENDPOINT_URL}"
+            aws s3 cp "release-assets/install.sh" "s3://${R2_BUCKET}/${LATEST_PREFIX}/install.sh" \
+              --endpoint-url "${ENDPOINT_URL}"
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -805,3 +731,20 @@ jobs:
           overwrite_files: false
           files: release-assets/*
           body_path: release-body.md
+
+      - name: Verify mirrored release notes
+        env:
+          GH_TOKEN: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          source_release="$(mktemp)"
+          published_release="$(mktemp)"
+          source_body="$(mktemp)"
+          published_body="$(mktemp)"
+          gh api "repos/apilots/talos/releases/tags/${RELEASE_TAG}" > "${source_release}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "${published_release}"
+          jq -j '.body' "${source_release}" > "${source_body}"
+          jq -j '.body' "${published_release}" > "${published_body}"
+          cmp "${source_body}" "${published_body}"
