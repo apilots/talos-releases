@@ -8,7 +8,15 @@ This repository stores Talos release artifacts and release automation only. It d
 - Source repository: https://github.com/apilots/talos
 - Issues and discussion: use the main Talos repository.
 
-The `Build release` workflow is invoked by the main Talos repository through `repository_dispatch` after a `v*` source Release is published and passes its release gate. The workflow checks out the tagged Talos source, builds release artifacts through `build.sh`, uploads GitHub Actions artifacts, and creates a GitHub Release in this repository.
+The `Build release` workflow accepts automatic and manual dispatch through the same
+mandatory gate: validate tagged source and Notes, run Talos-owned source checks,
+build products, run native TUI installation checks against those products, then
+publish artifacts and stable image tags. Gate failures block publication.
+
+The canonical [release policy](https://github.com/apilots/talos/blob/main/docs/development/RELEASE.md)
+owns branch/version timing, bug-fix-only stabilization, verification, and merge-back
+rules. This repository reuses the tagged source scripts; it does not maintain a
+second check implementation or a gate-bypass option.
 
 The matching Release in `apilots/talos` owns the canonical Release Notes. This repository reads that body by tag and publishes it unchanged. A missing or empty source Release fails the workflow; release-note generation is not duplicated here.
 

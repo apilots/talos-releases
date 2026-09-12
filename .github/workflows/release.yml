@@ -21,7 +21,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: talos-release-${{ github.event.client_payload.tag || inputs.tag || github.run_id }}
+  group: talos-release
   cancel-in-progress: false
 
 jobs:
@@ -37,6 +37,7 @@ jobs:
       - name: Resolve release metadata
         id: metadata
         env:
+          GH_TOKEN: ${{ github.token }}
           DISPATCH_TAG: ${{ github.event.client_payload.tag }}
           DISPATCH_VERSION: ${{ github.event.client_payload.version }}
           DISPATCH_PUBLISH_LATEST: ${{ github.event.client_payload.publish_latest }}
@@ -74,6 +75,24 @@ jobs:
           if [[ "${PUBLISH_LATEST}" != "true" && "${PUBLISH_LATEST}" != "false" ]]; then
             echo "publish_latest must be true or false." >&2
             exit 1
+          fi
+
+          if [[ "${PUBLISH_LATEST}" == "true" ]]; then
+            query_error="$(mktemp)"
+            if latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>"${query_error}")"; then
+              [[ "${latest_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "Cannot compare latest release version: ${latest_tag}" >&2
+                exit 1
+              }
+              newest_tag="$(printf '%s\n' "${TAG}" "${latest_tag}" | sort -V | tail -n 1)"
+              if [[ "${newest_tag}" != "${TAG}" ]]; then
+                PUBLISH_LATEST=false
+                echo "Keeping latest on newer release ${latest_tag}."
+              fi
+            elif ! grep -Fq "HTTP 404" "${query_error}"; then
+              cat "${query_error}" >&2
+              exit 1
+            fi
           fi
 
           {
@@ -149,23 +168,7 @@ jobs:
             }
           jq -j '.body' "${source_release}" > release-body.md
 
-          source_version="$(awk '
-            /^\[workspace.package\]/ { in_workspace_package = 1; next }
-            /^\[/ { in_workspace_package = 0 }
-            in_workspace_package && /^version = / {
-              gsub(/"/, "", $3)
-              print $3
-              exit
-            }
-          ' talos-rs/Cargo.toml)"
-          if [[ -z "${source_version}" ]]; then
-            echo "Could not resolve the Talos workspace version." >&2
-            exit 1
-          fi
-          if [[ "${source_version}" != "${RELEASE_VERSION}" ]]; then
-            echo "Talos workspace version ${source_version} does not match release version ${RELEASE_VERSION}." >&2
-            exit 1
-          fi
+          bash scripts/check-release-version.sh "${RELEASE_VERSION}"
 
           echo "sha=${checkout_sha}" >> "${GITHUB_OUTPUT}"
 
@@ -177,11 +180,49 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  quality:
+    name: Source release gate
+    needs: [prepare, validate-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: apilots/talos
+          ref: ${{ needs.validate-source.outputs.source_sha }}
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: apilots/talos-cloud
+          path: talos-cloud
+          token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
+      - run: ln -sfn "${GITHUB_WORKSPACE}/talos-cloud" "${GITHUB_WORKSPACE}/../talos-cloud"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: talos-rs
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.14.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: talos-app/pnpm-lock.yaml
+      - run: pnpm --dir talos-app install --frozen-lockfile
+      - name: Run Talos release checks
+        run: bash scripts/check-release.sh
+
   build:
     name: Build ${{ matrix.name }}
     needs:
       - prepare
       - validate-source
+      - quality
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -232,7 +273,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: apilots/talos
-          ref: ${{ needs.prepare.outputs.source_ref }}
+          ref: ${{ needs.validate-source.outputs.source_sha }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
           fetch-depth: 0
           fetch-tags: true
@@ -271,23 +312,6 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir talos-app install --frozen-lockfile
 
-      - name: Set package versions
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          node - <<'NODE'
-          const fs = require("node:fs");
-          const version = process.env.RELEASE_VERSION;
-          const paths = ["talos-app/desktop/package.json"];
-
-          for (const path of paths) {
-            const pkg = JSON.parse(fs.readFileSync(path, "utf8"));
-            pkg.version = version;
-            fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
-          }
-          NODE
-
       - name: Build product
         env:
           PROFILE: release
@@ -298,12 +322,22 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: ./build.sh "${{ matrix.build_target }}"
 
-      - name: Verify TUI release bundle
+      - name: Verify native TUI installation
         if: ${{ matrix.build_target == 'tui' }}
         env:
-          PROFILE: release
-          PRODUCT_DIR: ${{ github.workspace }}/dist/products/release
-        run: ./build/scripts/verify-release-artifacts.sh tui
+          TUI_INSTALL_PRODUCT_DIR: ${{ github.workspace }}/dist/products/release
+        run: talos-e2e/run_e2e.sh --case 15_tui_install/01_native_install
+
+      - name: Upload native installation report
+        if: ${{ always() && matrix.build_target == 'tui' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-install-report-${{ matrix.artifact_name }}
+          path: |
+            talos-e2e/reports/e2e_report_*.md
+            talos-e2e/reports/15_tui_install/01_native_install/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload product artifact
         uses: actions/upload-artifact@v4
@@ -318,6 +352,7 @@ jobs:
     needs:
       - prepare
       - validate-source
+      - quality
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -336,7 +371,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: apilots/talos
-          ref: ${{ needs.prepare.outputs.source_ref }}
+          ref: ${{ needs.validate-source.outputs.source_sha }}
           path: talos
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
           fetch-depth: 0
@@ -415,6 +450,7 @@ jobs:
     needs:
       - prepare
       - docker-image
+      - build
     runs-on: ubuntu-latest
     env:
       IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/talos-server
@@ -542,15 +578,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: apilots/talos
-          ref: ${{ needs.prepare.outputs.source_ref }}
+          ref: ${{ needs.validate-source.outputs.source_sha }}
           token: ${{ secrets.TALOS_SOURCE_READ_TOKEN || github.token }}
           fetch-depth: 0
           fetch-tags: true
-
-      - name: Test TUI installer
-        run: |
-          deploy/install/tests/install_test.sh
-          deploy/install/tests/release_contract_test.sh
 
       - name: Download product artifacts
         uses: actions/download-artifact@v4
@@ -729,6 +760,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           fail_on_unmatched_files: true
           overwrite_files: false
+          make_latest: ${{ needs.prepare.outputs.publish_latest }}
           files: release-assets/*
           body_path: release-body.md
 
